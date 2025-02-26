@@ -1,0 +1,9 @@
+flask
+torch
+transformers
+nltk
+psycopg2
+numpy
+langchain
+sentence-transformers
+pgvector
