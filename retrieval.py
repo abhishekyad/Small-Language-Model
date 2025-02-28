@@ -1,114 +1,62 @@
-import psycopg2
 import numpy as np
-
-from transformers import pipeline
-import nltk
-from nltk.corpus import wordnet
+import pandas as pd
+import ast  # Import ast for safe string to list conversion
+from sklearn.metrics.pairwise import cosine_similarity
 from embeddings import embedding_model  # Ensure this imports a valid embedding model
 
-# PostgreSQL connection details
-DB_NAME = "rag_db"
-DB_USER = "postgres"
-DB_PASSWORD = "qwerty"
-DB_HOST = "localhost"
-DB_PORT = "5432"
-
-# Connect to PostgreSQL
-conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT)
-cur = conn.cursor()
-paraphrase_pipeline = pipeline("text2text-generation", model="t5-small")
-
-def expand__with_lsca(question):
-    nltk.download("wordnet")
-    words = question.split()
-    expanded_terms = []
-
-    for word in words:
-        synonyms = set()
-        for syn in wordnet.synsets(word):
-            for lemma in syn.lemmas():
-                synonyms.add(lemma.name().replace("_", " "))
-        expanded_terms.extend(synonyms)
-
-    # Paraphrase the question using a small model (alternative: use OpenAI API)
-    paraphrased_question = paraphrase_pipeline(question, max_length=50, num_return_sequences=1)[0]["generated_text"]
-
-    # Combine original, synonyms, and paraphrased question
-    expanded_query = list(set(words + expanded_terms))  # Remove duplicates
-    return " ".join(expanded_query) + " " + paraphrased_question
-
-def store_document(document_text):
-    """Stores a document and its embedding in PostgreSQL."""
+def get_embeddings_from_file(filepath="documents_table.txt"):
+    """Reads embeddings from a txt file, parses them, and returns a DataFrame."""
     try:
-        embedding = embedding_model.embed_query(document_text)  # Generate embedding
-        
-        # Convert embedding to PostgreSQL array format
-        embedding_array = np.array(embedding).tolist()
+        df = pd.read_csv(filepath, sep='\t')
+        embedding_cols = [col for col in df.columns if col.startswith("embedding")]
 
-        # Insert into database
-        cur.execute("""
-            INSERT INTO documents (content, embedding) 
-            VALUES (%s, %s);
-        """, (document_text, embedding_array))
-        
-        conn.commit()
-        print("✅ Document stored successfully.")
-    
+        for col in embedding_cols:
+            df[col] = df[col].apply(lambda x: ast.literal_eval(x))  # Safely parse string to list
+
+        # Convert embedding columns to a NumPy array of floats
+        embeddings = np.array(df[embedding_cols].apply(lambda row: np.array(row.tolist())).tolist(), dtype=np.float32)
+
+        return df, embeddings
+
+    except FileNotFoundError:
+        print(f"❌ File not found: {filepath}")
+        return None, None
     except Exception as e:
-        print(f"❌ Error storing document: {e}")
-        conn.rollback()  # Rollback in case of error
-    # try:
-    #     embedding = embedding_model.embed_query(expand__with_lsca(document_text))  # Generate embedding
-        
-    #     # Convert embedding to PostgreSQL array format
-    #     embedding_array = np.array(embedding).tolist()
-
-    #     # Insert into database
-    #     cur.execute("""
-    #         INSERT INTO documents (content, embedding) 
-    #         VALUES (%s, %s);
-    #     """, (document_text, embedding_array))
-        
-    #     conn.commit()
-    #     print("✅ Document stored successfully.")
-    
-    # except Exception as e:
-    #     print(f"❌ Error storing document: {e}")
-    #     conn.rollback()  # Rollback in case of error
-
+        print(f"❌ Error reading embeddings from file: {e}")
+        return None, None
 
 def query_database(question, top_k=3):
-    """Retrieves the top-k most relevant documents based on semantic similarity."""
+    """Retrieves the top-k most relevant documents based on embeddings from DataFrame."""
     try:
         query_embedding = embedding_model.embed_query(question)
+        query_embedding = np.array(query_embedding).reshape(1, -1)  # Reshape for cosine_similarity
 
-        # Ensure the embedding size is 384
-        if len(query_embedding) != 384:
-            raise ValueError(f"Embedding size mismatch: Expected 384, got {len(query_embedding)}")
+        df, embeddings = get_embeddings_from_file()
 
-        query_embedding = np.array(query_embedding, dtype=np.float32)  # Convert to NumPy array
+        if df is None or embeddings is None:
+            return []
 
-        cur.execute("""
-            SELECT content FROM documents
-            ORDER BY embedding <-> %s::vector
-            LIMIT %s;
-        """, (query_embedding.tolist(), top_k))  # Convert to list before passing
+        similarities = cosine_similarity(query_embedding, embeddings)[0] # Calculate cosine similarities
 
-        results = cur.fetchall()
-        return [row[0] for row in results]
-    
+        top_indices = np.argsort(similarities)[::-1][:top_k] # Find top k indices
+
+        results = []
+        contents = df['content'].tolist() # get the content from the dataframe.
+
+        for index in top_indices:
+            if index < len(contents):
+                results.append(contents[index])
+
+        return results
+
     except Exception as e:
         print(f"❌ Error querying database: {e}")
         return []
 
-def close_connection():
-    """Closes the database connection."""
-    cur.close()
-    conn.close()
-
 # Example Usage
 if __name__ == "__main__":
-    with open("arcadia_dataset.txt", "r", encoding="utf-8") as file:
-        content = file.read()
-
-    store_document(content)
+    query = "What is a sample document?"
+    results = query_database(query)
+    print("\nQuery Results:")
+    for result in results:
+        print(result)
